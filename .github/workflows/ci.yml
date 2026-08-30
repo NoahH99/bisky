@@ -1,0 +1,105 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  UV_VERSION: "0.12.7"
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: true
+      - run: uv sync --locked
+      - name: Ruff lint
+        run: uv run ruff check --output-format=github .
+      - name: Ruff format
+        run: uv run ruff format --check .
+      - name: Mypy
+        run: uv run mypy
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: true
+      - run: uv sync --locked
+      - name: Pytest
+        run: uv run pytest --cov-report=xml
+      - name: Pre-commit
+        run: uv run pre-commit run --all-files --show-diff-on-failure
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: coverage
+          path: coverage.xml
+
+  migrations:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: bisky
+          POSTGRES_PASSWORD: bisky
+          POSTGRES_DB: bisky
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U bisky -d bisky"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      BISKY_DATABASE_URL: postgresql+asyncpg://bisky:bisky@localhost:5432/bisky
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: true
+      - run: uv sync --locked
+      - name: Upgrade to head
+        run: uv run alembic upgrade head
+      - name: Downgrade to base
+        run: uv run alembic downgrade base
+      - name: Upgrade again
+        run: uv run alembic upgrade head
+      - name: Fail if models drifted from migrations
+        run: uv run alembic check
+      # A separate database: the integration fixtures drop and recreate the
+      # schema, which would undo the migration state checked above.
+      - name: Create the integration test database
+        env:
+          PGPASSWORD: bisky
+        run: createdb -h localhost -U bisky bisky_test
+      - name: Integration tests against Postgres
+        env:
+          BISKY_TEST_DATABASE_URL: postgresql+asyncpg://bisky:bisky@localhost:5432/bisky_test
+        run: uv run pytest -m integration --no-cov
+
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          tags: bisky:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
