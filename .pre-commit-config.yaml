@@ -14,6 +14,16 @@ repos:
 
   - repo: local
     hooks:
+      # Every CI job starts with `uv sync --locked`, so a lockfile that has
+      # drifted from pyproject.toml fails the whole pipeline on push. Catch it
+      # here, where the fix is `uv lock` rather than a round trip.
+      - id: uv-lock-check
+        name: uv.lock is in sync with pyproject.toml
+        entry: uv lock --check
+        language: system
+        files: ^(pyproject\.toml|uv\.lock)$
+        pass_filenames: false
+
       - id: ruff-check
         name: ruff check
         entry: uv run ruff check --fix
