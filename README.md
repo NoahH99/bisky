@@ -621,6 +621,77 @@ mypy --strict), **test** (pytest, coverage artifact, pre-commit), **migrations**
 (round-trip and drift check plus the integration suite against real Postgres),
 and **docker** (image builds with layer caching).
 
+## Releasing and deploying
+
+Publishing a GitHub release builds the image and pushes it to Docker Hub for
+`linux/amd64` and `linux/arm64`.
+
+**One-time setup.** Add two repository secrets under *Settings → Secrets and
+variables → Actions*:
+
+| Secret | Value |
+| --- | --- |
+| `DOCKERHUB_USERNAME` | your Docker Hub username |
+| `DOCKERHUB_TOKEN` | a Docker Hub access token with Read/Write |
+
+**Cutting a release.** The workflow refuses to build if the git tag and
+`pyproject.toml` disagree, so bump the version first:
+
+```sh
+# 1. bump version = "0.2.0" in pyproject.toml, commit, push
+# 2. tag and release
+gh release create v0.2.0 --generate-notes
+```
+
+`__version__` is read from installed package metadata, so `pyproject.toml` is
+the only place the number appears and `bisky_build_info` can never report a
+version that was not released. `tests/test_version.py` enforces that.
+
+The gate lives in `.github/scripts/check_release_version.py` and compares
+*parsed* versions, not strings, because **Python normalises versions on
+install**: `0.1.0-alpha.1` in `pyproject.toml` becomes `0.1.0a1` in package
+metadata. So both spellings of a prerelease are accepted as the same version,
+while `v0.1.0` against `0.1.0a1` is correctly rejected — a prerelease is not the
+release. That script is covered by `tests/test_release_version.py`.
+
+Tags are parsed as **PEP 440**, not SemVer, since `pyproject.toml` constrains
+the project to PEP 440 anyway. Keeping the git tag in PEP 440 form (`v0.1.0a1`
+rather than `v0.1.0-alpha.1`) means the Docker tag and the version the bot
+reports are character-for-character identical.
+
+A release of `v0.2.0` publishes `0.2.0`, `0.2`, `0` and `latest`, so a host can
+pin as tightly or as loosely as it likes. Pre-releases do not move `latest`.
+
+**Deploying on the host.** Copy `docker-compose.prod.yml` and `.env` across —
+no source checkout needed, since that file pulls the image rather than building
+it:
+
+```sh
+sed -i 's/^BISKY_VERSION=.*/BISKY_VERSION=0.2.0/' .env
+docker compose -f docker-compose.prod.yml pull
+docker compose -f docker-compose.prod.yml up -d
+docker compose -f docker-compose.prod.yml ps      # bot should read "healthy"
+```
+
+The `migrate` service runs to completion before the bot starts, so a release
+carrying a migration applies it exactly once.
+
+### Raspberry Pi
+
+Needs a **64-bit** OS. Check with `uname -m`:
+
+| Output | Supported |
+| --- | --- |
+| `aarch64` | yes — this is what the arm64 image targets |
+| `armv7l` | no |
+
+32-bit is not a matter of adding a platform: `ghcr.io/astral-sh/uv` publishes no
+armv7 image, and `pydantic-core` would have to compile from Rust source under
+emulation. Reimage to 64-bit Raspberry Pi OS instead.
+
+The prod compose caps container logs at 3×10 MB, because unbounded JSON logs on
+an SD card end badly.
+
 ## Deployment notes
 
 The image runs as a non-root user (`bisky`, uid 1001) and installs the package

@@ -1,0 +1,83 @@
+# Deployment compose: pulls a published image instead of building.
+#
+# Copy this file, .env and nothing else onto the host. Then per release:
+#
+#     sed -i 's/^BISKY_VERSION=.*/BISKY_VERSION=0.2.0/' .env
+#     docker compose -f docker-compose.prod.yml pull
+#     docker compose -f docker-compose.prod.yml up -d
+#
+# Images are built for linux/amd64 and linux/arm64, so a 64-bit Raspberry Pi
+# OS works. A 32-bit install (`uname -m` shows armv7l) will not: the uv image
+# publishes no armv7 build.
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: bisky
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: bisky
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    ports:
+      # Loopback only. Remove entirely if you never need psql from the host.
+      - "127.0.0.1:${POSTGRES_PORT:-5432}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U bisky -d bisky"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  # Runs to completion before the bot starts, so a release that adds a
+  # migration applies it exactly once.
+  migrate:
+    image: ${BISKY_IMAGE:-bisky}:${BISKY_VERSION:-latest}
+    command: ["alembic", "upgrade", "head"]
+    environment:
+      BISKY_DATABASE_URL: postgresql+asyncpg://bisky:${POSTGRES_PASSWORD:?}@postgres:5432/bisky
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+  bot:
+    image: ${BISKY_IMAGE:-bisky}:${BISKY_VERSION:-latest}
+    env_file:
+      - path: .env
+        required: true
+    environment:
+      BISKY_DATABASE_URL: postgresql+asyncpg://bisky:${POSTGRES_PASSWORD:?}@postgres:5432/bisky
+      BISKY_LOG_FORMAT: ${BISKY_LOG_FORMAT:-json}
+      BISKY_HTTP_PORT: 8080
+    ports:
+      - "127.0.0.1:${BISKY_HTTP_PORT:-8080}:8080"
+    # PID 1 ignores signals with no handler; the bot installs its own SIGTERM
+    # handler, and init reaps zombies.
+    init: true
+    stop_grace_period: 20s
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - import urllib.request;urllib.request.urlopen('http://127.0.0.1:8080/readyz')
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
+    depends_on:
+      postgres:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    restart: unless-stopped
+    logging:
+      # A Pi's SD card will not thank you for unbounded JSON logs.
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  postgres-data:
