@@ -21,6 +21,7 @@ import structlog.testing
 from bisky import __main__ as entrypoint
 from bisky.bot import Bisky
 from bisky.config import Settings
+from bisky.db import repository
 from bisky.db.session import Database
 from tests.helpers import sample
 
@@ -197,3 +198,32 @@ def test_build_database_applies_engine_options(settings: Settings) -> None:
     database = entrypoint.build_database(settings)
 
     assert database.engine.url.drivername == "sqlite+aiosqlite"
+
+
+async def test_seeding_grants_configured_admins(settings: Settings, database: Database) -> None:
+    bot = Bisky(settings.model_copy(update={"global_admin_ids": [11, 22]}), database)
+
+    await bot.seed_global_admins()
+
+    async with database.session() as session:
+        assert await repository.count_global_admins(session) == 2
+
+
+async def test_seeding_survives_a_database_failure(settings: Settings, database: Database) -> None:
+    """A DB hiccup must not abort setup_hook and crash-loop the container."""
+    bot = Bisky(settings.model_copy(update={"global_admin_ids": [11]}), database)
+    await database.dispose()
+
+    with structlog.testing.capture_logs() as logs:
+        await bot.seed_global_admins()
+
+    assert any(entry["event"] == "could not seed global admins" for entry in logs)
+
+
+async def test_seeding_is_skipped_when_unconfigured(settings: Settings, database: Database) -> None:
+    bot = Bisky(settings, database)
+
+    await bot.seed_global_admins()
+
+    async with database.session() as session:
+        assert await repository.count_global_admins(session) == 0

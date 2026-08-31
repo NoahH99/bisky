@@ -55,6 +55,13 @@ GATEWAY_EVENTS = Counter(
     ["event"],
 )
 
+PREFIX_CACHE = Counter(
+    "bisky_prefix_cache_total",
+    "Guild prefix lookups, by cache outcome. Misses should be rare and flat; "
+    "a rising miss rate means the cache is being invalidated too aggressively.",
+    ["result"],
+)
+
 LISTENER_ERRORS = Counter(
     "bisky_listener_errors_total",
     "Exceptions raised inside event listeners.",
@@ -90,6 +97,25 @@ DB_POOL = Gauge(
     "bisky_db_pool_connections",
     "Connection pool occupancy.",
     ["state"],
+)
+
+ECONOMY_MINTED = Counter(
+    "bisky_economy_minted_total",
+    "Aura created, by source. Together with the burned counter this is the "
+    "inflation number: graph minted minus burned to see whether the money "
+    "supply is growing faster than sinks can absorb it.",
+    ["source"],
+)
+
+ECONOMY_BURNED = Counter(
+    "bisky_economy_burned_total",
+    "Aura destroyed, by sink.",
+    ["sink"],
+)
+
+ECONOMY_VOICE_EARNERS = Gauge(
+    "bisky_economy_voice_earners",
+    "Members who earned aura in the most recent voice tick.",
 )
 
 BUILD_INFO = Info("bisky_build", "Versions this process is running.")

@@ -37,3 +37,18 @@ class TimestampMixin:
         server_default=func.now(),
         nullable=False,
     )
+
+
+class MutableTimestampMixin(TimestampMixin):
+    """Adds ``updated_at`` for rows that are edited after insert.
+
+    Append-only tables should keep plain :class:`TimestampMixin`; an
+    ``updated_at`` that can never change is just a confusing duplicate.
+    """
+
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+        nullable=False,
+    )

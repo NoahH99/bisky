@@ -1,0 +1,14 @@
+{
+  "Servers": {
+    "1": {
+      "Name": "bisky",
+      "Group": "Servers",
+      "Host": "postgres",
+      "Port": 5432,
+      "MaintenanceDB": "bisky",
+      "Username": "bisky",
+      "SSLMode": "prefer",
+      "Comment": "Pre-registered by docker/pgadmin/servers.json. Imported only on first start, while the pgadmin-data volume is empty."
+    }
+  }
+}

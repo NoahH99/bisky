@@ -11,11 +11,16 @@ import discord
 import structlog.contextvars
 from discord import app_commands
 from discord.ext import commands
+from sqlalchemy.exc import SQLAlchemyError
 
 from bisky import cogs, observability
+from bisky.checks import CogDisabled
 from bisky.config import Settings
+from bisky.db.repository import seed_global_admins as seed_admin_grants
 from bisky.db.session import Database
+from bisky.guild_cogs import GuildCogCache, cog_for_context, key_from_module
 from bisky.health import GatewayState, HealthServer
+from bisky.help import BiskyHelpCommand, attach_group_help
 from bisky.logging import get_logger
 from bisky.metrics import (
     COMMANDS,
@@ -23,6 +28,7 @@ from bisky.metrics import (
     bind_runtime_gauges,
     monitor_event_loop_lag,
 )
+from bisky.prefix import PrefixCache, resolve_prefix
 
 log = get_logger(__name__)
 
@@ -77,6 +83,15 @@ class BiskyCommandTree(app_commands.CommandTree["Bisky"]):
             user_id=interaction.user.id,
             guild_id=interaction.guild_id,
         )
+
+        # Hybrid commands are gated by the bot's global check, which runs in
+        # Command.prepare. Pure application commands never touch that path, so
+        # they are gated here instead.
+        cog = key_from_module(getattr(command, "module", None))
+        if cog is not None and not await self.client.guild_cogs.is_enabled(
+            cog, interaction.guild_id
+        ):
+            raise CogDisabled(cog)
         return True
 
     async def on_error(
@@ -119,9 +134,11 @@ class Bisky(commands.Bot):
 
     def __init__(self, settings: Settings, database: Database) -> None:
         super().__init__(
-            command_prefix=commands.when_mentioned_or(settings.command_prefix),
+            # A callable, because the prefix is per-guild. resolve_prefix reads
+            # from an in-memory cache, never the database.
+            command_prefix=resolve_prefix,
             intents=build_intents(),
-            help_command=commands.DefaultHelpCommand(no_category="General"),
+            help_command=BiskyHelpCommand(),
             allowed_mentions=discord.AllowedMentions.none(),
             tree_cls=BiskyCommandTree,
             owner_ids=set(settings.owner_ids),
@@ -129,6 +146,8 @@ class Bisky(commands.Bot):
         )
         self.settings = settings
         self.db = database
+        self.prefixes = PrefixCache(database, settings.command_prefix)
+        self.guild_cogs = GuildCogCache(database)
         self.gateway_state = GatewayState()
         self.health = HealthServer(
             self.gateway_state,
@@ -156,7 +175,18 @@ class Bisky(commands.Bot):
         observability.register(self)
         bind_runtime_gauges(self, self.db)
 
+        # Deliberately NOT call_once: call_once checks run only in
+        # BotBase.invoke, which hybrid commands invoked as slash commands never
+        # reach — they call Command.prepare directly. A default global check
+        # runs inside prepare, so it covers both paths.
+        self.add_check(self.cog_is_enabled)
+
+        await self.seed_global_admins()
         await self.load_extensions()
+
+        # After loading, so every group that exists gets one.
+        attached = attach_group_help(self)
+        log.debug("attached group help subcommands", groups=attached)
 
         self._lag_task = asyncio.create_task(
             monitor_event_loop_lag(warn_threshold=self.settings.event_loop_lag_warn_seconds),
@@ -164,6 +194,35 @@ class Bisky(commands.Bot):
         )
 
         await self._sync_commands_on_startup()
+
+    async def cog_is_enabled(self, ctx: commands.Context[Any]) -> bool:
+        """Global check: refuse commands whose cog is off in this guild."""
+        cog = cog_for_context(ctx)
+        if cog is None:
+            return True
+        guild_id = ctx.guild.id if ctx.guild else None
+        if not await self.guild_cogs.is_enabled(cog, guild_id):
+            raise CogDisabled(cog)
+        return True
+
+    async def seed_global_admins(self) -> None:
+        """Grant admin to the configured user IDs.
+
+        Additive only: it never revokes an admin missing from configuration, or
+        deploying with the variable unset would wipe the admin list. Failures
+        are logged rather than raised, because the application owner is an
+        admin regardless and can repair things from inside Discord.
+        """
+        configured = self.settings.global_admin_ids
+        if not configured:
+            return
+        try:
+            async with self.db.session() as session:
+                added = await seed_admin_grants(session, configured)
+        except SQLAlchemyError:
+            log.exception("could not seed global admins")
+            return
+        log.info("seeded global admins", configured=len(configured), added=len(added))
 
     async def load_extensions(self) -> None:
         for extension in self.extension_names:

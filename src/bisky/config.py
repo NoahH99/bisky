@@ -56,9 +56,13 @@ class Settings(BaseSettings):
     # sleeping indefinitely. None keeps discord.py's default (sleep forever).
     max_ratelimit_timeout: float | None = None
 
-    # Users allowed to run the admin cog. Setting this also avoids an
-    # application_info() round-trip on every is_owner() check.
+    # The application owner(s). Always implicitly global admins, and setting
+    # this avoids an application_info() round-trip on every is_owner() check.
     owner_ids: list[int] = Field(default_factory=list)
+
+    # Granted global admin at startup, additively — handy in development so a
+    # fresh database is not admin-less. Never revokes anyone.
+    global_admin_ids: list[int] = Field(default_factory=list)
 
     # Publishing the command tree costs a request against a limited daily
     # budget, so it is worth turning off once the tree has stopped changing.

@@ -2,7 +2,7 @@
 SHELL := /bin/bash
 
 .PHONY: help install hooks fmt lint typecheck test test-integration check run migrate \
-	revision up up-core down logs metrics dashboards docker-build
+	revision up up-core down logs metrics urls dashboards docker-build
 
 help: ## Show this help
 	@grep -hE '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) \
@@ -64,9 +64,13 @@ logs: ## Tail bot logs
 metrics: ## Print the bot's current metrics
 	curl -fsS http://127.0.0.1:8080/metrics
 
-dashboards: ## Open Grafana
+urls: ## Print the local web UIs
 	@echo "Grafana:    http://127.0.0.1:3000/d/bisky-overview"
 	@echo "Prometheus: http://127.0.0.1:9090/targets"
+	@echo "pgAdmin:    http://127.0.0.1:5050  (server 'bisky' pre-registered, password: $${POSTGRES_PASSWORD:-bisky})"
+	@echo "Bot health: http://127.0.0.1:8080/readyz"
+
+dashboards: urls ## Alias for urls
 
 docker-build: ## Build the image
 	docker build -t bisky:local .

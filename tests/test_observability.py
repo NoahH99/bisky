@@ -13,6 +13,8 @@ import pytest
 import structlog.testing
 from discord.ext import commands
 
+from bisky.db.session import Database
+from bisky.guild_cogs import GuildCogCache
 from bisky.health import GatewayState
 from bisky.observability import (
     ERROR,
@@ -24,6 +26,7 @@ from bisky.observability import (
     RateLimitCounter,
     classify,
 )
+from bisky.prefix import PrefixCache
 from tests.helpers import sample
 
 
@@ -44,13 +47,16 @@ class StubContext:
 
 
 class StubBot:
-    def __init__(self) -> None:
+    def __init__(self, database: Database | None = None) -> None:
         self.gateway_state = GatewayState()
+        # on_guild_remove evicts this guild's cached per-guild state.
+        self.prefixes = PrefixCache(cast(Database, database), default="!")
+        self.guild_cogs = GuildCogCache(cast(Database, database))
 
 
 @pytest.fixture
-def observer() -> Observer:
-    return Observer(cast(Any, StubBot()))
+def observer(database: Database) -> Observer:
+    return Observer(cast(Any, StubBot(database)))
 
 
 def commands_total(command: str, kind: str, outcome: str) -> float:
@@ -204,6 +210,18 @@ async def test_guild_events_log_without_content(observer: Observer) -> None:
         await observer.on_guild_remove(guild)
 
     assert [entry["event"] for entry in logs] == ["joined guild", "left guild"]
+
+
+async def test_leaving_a_guild_evicts_its_cached_state(observer: Observer) -> None:
+    """Otherwise the caches grow forever across guilds the bot has left."""
+    guild = cast(Any, type("G", (), {"id": 7, "member_count": 12})())
+    observer.bot.prefixes.remember(7, "?")
+    observer.bot.guild_cogs.remember(7, frozenset({"economy"}))
+
+    await observer.on_guild_remove(guild)
+
+    assert len(observer.bot.prefixes) == 0
+    assert len(observer.bot.guild_cogs) == 0
 
 
 @pytest.mark.parametrize(

@@ -210,6 +210,10 @@ class Observer:
         log.info("joined guild", guild_id=guild.id, members=guild.member_count)
 
     async def on_guild_remove(self, guild: discord.Guild) -> None:
+        # Drop cached per-guild state so the caches cannot grow without bound
+        # across guilds the bot is no longer in.
+        self.bot.prefixes.forget(guild.id)
+        self.bot.guild_cogs.forget(guild.id)
         log.info("left guild", guild_id=guild.id)
 
 

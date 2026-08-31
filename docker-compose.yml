@@ -99,7 +99,31 @@ services:
       - prometheus
     restart: unless-stopped
 
+  # Database browser. Local convenience only: it is bound to loopback and runs
+  # in desktop mode, so there is no login and no exposed surface.
+  pgadmin:
+    image: dpage/pgadmin4:9.8
+    environment:
+      PGADMIN_DEFAULT_EMAIL: ${PGADMIN_EMAIL:-admin@example.com}
+      PGADMIN_DEFAULT_PASSWORD: ${PGADMIN_PASSWORD:-admin}
+      # Desktop mode skips the login screen; without the second flag it would
+      # still demand a master password on every start.
+      PGADMIN_CONFIG_SERVER_MODE: "False"
+      PGADMIN_CONFIG_MASTER_PASSWORD_REQUIRED: "False"
+      # pgAdmin is chatty about upgrade checks it cannot reach.
+      PGADMIN_DISABLE_POSTFIX: "True"
+    volumes:
+      - ./docker/pgadmin/servers.json:/pgadmin4/servers.json:ro
+      - pgadmin-data:/var/lib/pgadmin
+    ports:
+      - "127.0.0.1:${PGADMIN_PORT:-5050}:80"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
 volumes:
   postgres-data:
   prometheus-data:
   grafana-data:
+  pgadmin-data:

@@ -153,14 +153,14 @@ def test_discover_extensions_finds_every_cog() -> None:
     found = discover_extensions()
 
     assert "bisky.cogs.ping" in found
-    assert "bisky.cogs.admin" in found
+    assert "bisky.cogs.global_admin" in found
     assert found == sorted(found)
 
 
 def test_discover_extensions_honours_the_deny_list() -> None:
-    found = discover_extensions(disabled=["admin"])
+    found = discover_extensions(disabled=["global_admin"])
 
-    assert "bisky.cogs.admin" not in found
+    assert "bisky.cogs.global_admin" not in found
     assert "bisky.cogs.ping" in found
 
 
@@ -169,16 +169,36 @@ def test_extension_names_prefers_an_explicit_list(settings: Settings, database: 
     discovered = Bisky(settings.model_copy(update={"extensions": None}), database)
 
     assert explicit.extension_names == ["bisky.cogs.ping"]
-    assert "bisky.cogs.admin" in discovered.extension_names
+    assert "bisky.cogs.global_admin" in discovered.extension_names
 
 
 async def test_autodiscovery_loads_every_cog(settings: Settings, database: Database) -> None:
+    """Every discovered extension must actually load.
+
+    load_extensions deliberately logs and continues on failure so one broken
+    cog cannot stop the bot booting — which means a cog that raises on import
+    disappears silently. Asserting the full set is what catches that.
+    """
+    bot = Bisky(settings.model_copy(update={"extensions": None}), database)
+    discovered = discover_extensions()
+
+    await bot.load_extensions()
+
+    assert set(discovered) == set(bot.extensions)
+    assert bot.get_cog("Ping") is not None
+    assert bot.get_cog("Global Admin") is not None
+
+
+async def test_every_cog_registers_at_least_one_command(
+    settings: Settings, database: Database
+) -> None:
+    """A cog that loads but exposes nothing is almost certainly a mistake."""
     bot = Bisky(settings.model_copy(update={"extensions": None}), database)
 
     await bot.load_extensions()
 
-    assert bot.get_cog("Ping") is not None
-    assert bot.get_cog("Admin") is not None
+    for name, cog in bot.cogs.items():
+        assert cog.get_commands() or cog.get_app_commands(), f"{name} exposes no commands"
 
 
 async def test_prefix_invocation_binds_logging_context(
