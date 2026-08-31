@@ -36,6 +36,13 @@ increment `lifetime_earned`, which is what the pacing model in §3 is built on.
 | Voice | `voice_aura_per_minute = 1` per qualifying minute | none |
 | Message | `message_aura = 2` per message | one per `message_cooldown_seconds = 60` |
 | Work | `U{100, …, 200}` (uniform) | one per `work_cooldown_seconds = 86400` |
+| Admin grant | arbitrary, via `!economy give` | global admins only |
+
+Administrative grants are real minting and are counted as
+`bisky_economy_minted_total{source="admin"}`, so hand-outs show up in the
+inflation graph rather than quietly invalidating the model in §4.1. They do not
+increment `lifetime_earned` (I4): the aura was not earned, and counting it would
+distort the progression figures in §3.
 
 Daily income for a member with `h` qualifying voice hours and `m` rewarded
 messages:
@@ -152,6 +159,7 @@ exchange for the ladder being reachable at all.
 | Transfer tax | `⌊0.05·a⌋` | burns |
 | Robbery take | 25 % of victim's wallet | **moves** |
 | Transfer body | remainder | **moves** |
+| Admin removal | arbitrary, via `!economy take` / `reset` | burns |
 
 ### 4.1 Steady-state capacity
 

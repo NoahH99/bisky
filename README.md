@@ -132,7 +132,7 @@ it safe. Roles are bought from the wallet, so banking has a real cost.
 !buy @Tier I           # buy one with wallet aura
 ```
 
-Admin (Administrator, or any global admin):
+Guild admin (Administrator, or any global admin) — tuning and the shop:
 
 ```
 !economy                                  # show tuning and aura in circulation
@@ -141,6 +141,31 @@ Admin (Administrator, or any global admin):
 !economy role add @Cosmetic 99            # no tier = standalone
 !economy role remove @Cosmetic
 ```
+
+Global admin only — anything that creates or destroys aura:
+
+```
+!economy give @user 500            # mint into their wallet
+!economy give @user 500 bank       # ...or straight into the bank, no fee
+!economy take @user 200            # burn from their wallet
+!economy take @user 200 bank
+!economy reset @user               # zero both pots
+!economy inspect @user             # balances, tiers, recent logged movements
+```
+
+The split is deliberate. Tuning your own server's rates is a reasonable
+Administrator power; **minting currency is not**, or any server owner could hand
+themselves the whole role ladder. Note that a group with
+`invoke_without_command=True` does *not* run its own checks when a subcommand is
+invoked, so each of these carries `@global_admin()` individually — there is a
+test asserting none of them is left unchecked.
+
+Grants and removals are counted as
+`bisky_economy_minted_total{source="admin"}` and
+`bisky_economy_burned_total{sink="admin"}`, so hand-outs are visible in the
+inflation graph instead of silently breaking the model. They are written to the
+transaction log with who did it, and granted aura deliberately does **not** count
+towards `lifetime_earned`.
 
 ### Games
 

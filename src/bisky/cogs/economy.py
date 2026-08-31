@@ -19,7 +19,7 @@ import discord
 from discord.ext import commands, tasks
 
 from bisky.bot import Bisky
-from bisky.checks import guild_admin
+from bisky.checks import global_admin, guild_admin
 from bisky.db.repository import economy as repo
 from bisky.economy import (
     DEFAULT_LADDER_PRICES,
@@ -41,6 +41,9 @@ COG_KEY = "economy"
 VOICE_TICK_SECONDS = 60
 LEADERBOARD_SIZE = 10
 WORK_COOLDOWN_KEY = "work"
+
+WALLET = "wallet"
+BANK = "bank"
 
 WORK_FLAVOUR = (
     "You fixed the office printer.",
@@ -65,6 +68,16 @@ TUNABLE_FIELDS = {
     "max_bet": 0,
     "lottery_ticket_price": 1,
 }
+
+
+def parse_destination(value: str) -> str:
+    """Which pot an admin command should act on."""
+    choice = value.strip().lower()
+    if choice in {WALLET, "w"}:
+        return WALLET
+    if choice in {BANK, "b"}:
+        return BANK
+    raise commands.BadArgument(f"Expected `{WALLET}` or `{BANK}`, got `{value}`.")
 
 
 def humanise(seconds: float) -> str:
@@ -569,6 +582,173 @@ class Economy(commands.Cog, name="Economy"):
 
         log.info("economy setting changed", field=key, value=value, guild_id=ctx.guild.id)
         await ctx.reply(f"✅ `{key}` is now `{value}`.")
+
+    # -- global admin ---------------------------------------------------------
+    #
+    # These mint and burn aura directly, so they are restricted to global
+    # admins rather than guild Administrators: a guild admin tuning their own
+    # rates is fine, handing themselves half a million aura is not.
+    #
+    # A group with invoke_without_command=True does not run its own checks when
+    # a subcommand is invoked, so every one of these carries its own.
+
+    @economy.command(name="give", aliases=["grant"])  # type: ignore[arg-type]
+    @global_admin()
+    async def economy_give(
+        self,
+        ctx: commands.Context[Bisky],
+        member: discord.Member,
+        amount: int,
+        destination: str = WALLET,
+    ) -> None:
+        """Create aura in someone's wallet or bank."""
+        assert ctx.guild is not None
+        where = parse_destination(destination)
+        if amount <= 0:
+            raise commands.BadArgument("The amount must be greater than zero.")
+
+        async with self.bot.db.session() as session:
+            if where == BANK:
+                account = await repo.credit_bank(session, ctx.guild.id, member.id, amount)
+            else:
+                account = await repo.credit_wallet(
+                    session, ctx.guild.id, member.id, amount, count_as_earned=False
+                )
+            await repo.log_transaction(
+                session,
+                guild_id=ctx.guild.id,
+                user_id=member.id,
+                kind="admin_give",
+                amount=amount,
+                wallet_after=account.wallet,
+                bank_after=account.bank,
+            )
+            wallet, bank = account.wallet, account.bank
+
+        # Counted so administrative minting still shows up as inflation.
+        ECONOMY_MINTED.labels(source="admin").inc(amount)
+        log.info(
+            "admin granted aura",
+            target=member.id,
+            amount=amount,
+            destination=where,
+            by=ctx.author.id,
+            guild_id=ctx.guild.id,
+        )
+        await ctx.reply(
+            f"✨ Gave `{format_aura(amount)}` aura to {member.display_name}'s {where}. "
+            f"Wallet `{format_aura(wallet)}`, bank `{format_aura(bank)}`."
+        )
+
+    @economy.command(name="take", aliases=["remove"])  # type: ignore[arg-type]
+    @global_admin()
+    async def economy_take(
+        self,
+        ctx: commands.Context[Bisky],
+        member: discord.Member,
+        amount: int,
+        destination: str = WALLET,
+    ) -> None:
+        """Destroy aura from someone's wallet or bank."""
+        assert ctx.guild is not None
+        where = parse_destination(destination)
+        if amount <= 0:
+            raise commands.BadArgument("The amount must be greater than zero.")
+
+        async with self.bot.db.session() as session:
+            debit = repo.debit_bank if where == BANK else repo.debit_wallet
+            if not await debit(session, ctx.guild.id, member.id, amount):
+                account = await repo.get_account(session, ctx.guild.id, member.id)
+                held = account.bank if where == BANK else account.wallet
+                await ctx.reply(
+                    f"⚠️ {member.display_name}'s {where} only holds `{format_aura(held)}` aura."
+                )
+                return
+
+            account = await repo.get_account(session, ctx.guild.id, member.id)
+            await repo.log_transaction(
+                session,
+                guild_id=ctx.guild.id,
+                user_id=member.id,
+                kind="admin_take",
+                amount=-amount,
+                wallet_after=account.wallet,
+                bank_after=account.bank,
+            )
+            wallet, bank = account.wallet, account.bank
+
+        ECONOMY_BURNED.labels(sink="admin").inc(amount)
+        log.info(
+            "admin removed aura",
+            target=member.id,
+            amount=amount,
+            destination=where,
+            by=ctx.author.id,
+            guild_id=ctx.guild.id,
+        )
+        await ctx.reply(
+            f"🗑️ Took `{format_aura(amount)}` aura from {member.display_name}'s {where}. "
+            f"Wallet `{format_aura(wallet)}`, bank `{format_aura(bank)}`."
+        )
+
+    @economy.command(name="reset")  # type: ignore[arg-type]
+    @global_admin()
+    async def economy_reset(self, ctx: commands.Context[Bisky], member: discord.Member) -> None:
+        """Zero someone's wallet and bank."""
+        assert ctx.guild is not None
+        async with self.bot.db.session() as session:
+            wallet, bank = await repo.clear_balances(session, ctx.guild.id, member.id)
+            if wallet or bank:
+                await repo.log_transaction(
+                    session,
+                    guild_id=ctx.guild.id,
+                    user_id=member.id,
+                    kind="admin_reset",
+                    amount=-(wallet + bank),
+                    wallet_after=0,
+                    bank_after=0,
+                )
+
+        ECONOMY_BURNED.labels(sink="admin").inc(wallet + bank)
+        log.warning(
+            "admin reset an account",
+            target=member.id,
+            removed=wallet + bank,
+            by=ctx.author.id,
+            guild_id=ctx.guild.id,
+        )
+        await ctx.reply(
+            f"💥 Reset {member.display_name}, destroying `{format_aura(wallet + bank)}` aura "
+            f"(`{format_aura(wallet)}` wallet, `{format_aura(bank)}` bank). "
+            "Role purchases are untouched."
+        )
+
+    @economy.command(name="inspect", aliases=["audit"])  # type: ignore[arg-type]
+    @global_admin()
+    async def economy_inspect(self, ctx: commands.Context[Bisky], member: discord.Member) -> None:
+        """Show an account and its recent logged movements."""
+        assert ctx.guild is not None
+        async with self.bot.db.session() as session:
+            account = await repo.get_account(session, ctx.guild.id, member.id)
+            history = await repo.recent_transactions(session, ctx.guild.id, member.id)
+            tiers = await repo.owned_tiers(session, ctx.guild.id, member.id)
+            summary = (
+                f"👜 `{format_aura(account.wallet)}`  🏦 `{format_aura(account.bank)}`  "
+                f"📈 earned `{format_aura(account.lifetime_earned)}`"
+            )
+            roles = f"Ladder tiers owned: {sorted(tiers) or 'none'}"
+
+        if history:
+            # Routine earning is not logged, so this is only notable movements.
+            lines = "\n".join(
+                f"`{entry.created_at:%Y-%m-%d %H:%M}` {entry.kind} "
+                f"{entry.amount:+} → 👜{entry.wallet_after} 🏦{entry.bank_after}"
+                for entry in history
+            )
+        else:
+            lines = "_No logged transactions. Routine earning is not recorded._"
+
+        await ctx.reply(f"**{member.display_name}**\n{summary}\n{roles}\n\n{lines}")
 
     @economy.group(name="role", invoke_without_command=True)  # type: ignore[arg-type]
     @guild_admin()

@@ -10,10 +10,12 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, cast
 
+import discord
 import pytest
 from discord.ext import commands
 
 from bisky.bot import Bisky
+from bisky.checks import NotGlobalAdmin, NotGuildAdmin
 from bisky.cogs.economy import ALL, Economy, parse_amount, setup
 from bisky.config import Settings
 from bisky.db.repository import economy as repo
@@ -488,3 +490,253 @@ async def test_voice_tick_survives_a_client_that_never_logged_in(
 
 async def test_voice_tick_is_a_noop_without_guilds(cog: Economy) -> None:
     await cog.voice_tick()
+
+
+# -- global admin commands ---------------------------------------------------
+
+
+@pytest.fixture
+async def admin_bot(settings: Settings, database: Database) -> Bisky:
+    """A bot where USER is the application owner, so counts as a global admin."""
+    bot = Bisky(settings.model_copy(update={"owner_ids": [USER]}), database)
+    async with database.session() as session:
+        await enable_cog(session, GUILD, "economy")
+    return bot
+
+
+@pytest.fixture
+def admin_cog(admin_bot: Bisky) -> Economy:
+    return Economy(admin_bot)
+
+
+def target(user_id: int = 5555) -> Any:
+    return cast(Any, type("M", (), {"id": user_id, "display_name": "target", "bot": False})())
+
+
+async def test_give_mints_into_the_wallet(admin_cog: Economy, database: Database) -> None:
+    minted = sample("bisky_economy_minted_total", source="admin")
+    ctx = StubContext()
+
+    await run(admin_cog, "economy_give", ctx, target(), 500, "wallet")
+
+    assert await wallet_of(database, 5555) == 500
+    assert sample("bisky_economy_minted_total", source="admin") == minted + 500
+
+
+async def test_give_can_target_the_bank(admin_cog: Economy, database: Database) -> None:
+    """Bypasses the deposit fee; only admin grants may do that."""
+    ctx = StubContext()
+
+    await run(admin_cog, "economy_give", ctx, target(), 1_000, "bank")
+
+    async with database.session() as session:
+        account = await repo.get_account(session, GUILD, 5555)
+    assert (account.wallet, account.bank) == (0, 1_000)
+
+
+async def test_granted_aura_is_not_lifetime_earned(admin_cog: Economy, database: Database) -> None:
+    """It was not earned, and counting it would distort the pacing model."""
+    await run(admin_cog, "economy_give", StubContext(), target(), 900, "wallet")
+
+    async with database.session() as session:
+        assert (await repo.get_account(session, GUILD, 5555)).lifetime_earned == 0
+
+
+async def test_give_defaults_to_the_wallet(admin_cog: Economy, database: Database) -> None:
+    await run(admin_cog, "economy_give", StubContext(), target(), 250)
+
+    assert await wallet_of(database, 5555) == 250
+
+
+@pytest.mark.parametrize("amount", [0, -100])
+async def test_give_rejects_non_positive_amounts(admin_cog: Economy, amount: int) -> None:
+    with pytest.raises(commands.BadArgument, match="greater than zero"):
+        await run(admin_cog, "economy_give", StubContext(), target(), amount, "wallet")
+
+
+async def test_give_rejects_an_unknown_destination(admin_cog: Economy) -> None:
+    with pytest.raises(commands.BadArgument, match="wallet"):
+        await run(admin_cog, "economy_give", StubContext(), target(), 100, "pocket")
+
+
+async def test_take_burns_from_the_wallet(admin_cog: Economy, database: Database) -> None:
+    async with database.session() as session:
+        await repo.credit_wallet(session, GUILD, 5555, 1_000)
+    burned = sample("bisky_economy_burned_total", sink="admin")
+
+    await run(admin_cog, "economy_take", StubContext(), target(), 400, "wallet")
+
+    assert await wallet_of(database, 5555) == 600
+    assert sample("bisky_economy_burned_total", sink="admin") == burned + 400
+
+
+async def test_take_burns_from_the_bank(admin_cog: Economy, database: Database) -> None:
+    async with database.session() as session:
+        await repo.credit_bank(session, GUILD, 5555, 800)
+
+    await run(admin_cog, "economy_take", StubContext(), target(), 300, "bank")
+
+    async with database.session() as session:
+        assert (await repo.get_account(session, GUILD, 5555)).bank == 500
+
+
+async def test_take_refuses_to_overdraw(admin_cog: Economy, database: Database) -> None:
+    async with database.session() as session:
+        await repo.credit_wallet(session, GUILD, 5555, 100)
+    ctx = StubContext()
+
+    await run(admin_cog, "economy_take", ctx, target(), 500, "wallet")
+
+    assert "only holds" in ctx.replies[0]
+    assert await wallet_of(database, 5555) == 100
+
+
+async def test_reset_zeroes_both_pots(admin_cog: Economy, database: Database) -> None:
+    async with database.session() as session:
+        await repo.credit_wallet(session, GUILD, 5555, 700)
+        await repo.credit_bank(session, GUILD, 5555, 300)
+    burned = sample("bisky_economy_burned_total", sink="admin")
+    ctx = StubContext()
+
+    await run(admin_cog, "economy_reset", ctx, target())
+
+    async with database.session() as session:
+        account = await repo.get_account(session, GUILD, 5555)
+    assert (account.wallet, account.bank) == (0, 0)
+    assert sample("bisky_economy_burned_total", sink="admin") == burned + 1_000
+    assert "1,000" in ctx.replies[0]
+
+
+async def test_reset_of_an_empty_account_is_harmless(admin_cog: Economy) -> None:
+    ctx = StubContext()
+
+    await run(admin_cog, "economy_reset", ctx, target())
+
+    assert "0" in ctx.replies[0]
+
+
+async def test_admin_actions_are_written_to_the_audit_log(
+    admin_cog: Economy, database: Database
+) -> None:
+    await run(admin_cog, "economy_give", StubContext(), target(), 500, "wallet")
+    await run(admin_cog, "economy_take", StubContext(), target(), 200, "wallet")
+
+    async with database.session() as session:
+        history = await repo.recent_transactions(session, GUILD, 5555)
+
+    kinds = {entry.kind for entry in history}
+    assert {"admin_give", "admin_take"} <= kinds
+
+
+async def test_inspect_reports_balances_and_history(admin_cog: Economy, database: Database) -> None:
+    await run(admin_cog, "economy_give", StubContext(), target(), 1_500, "bank")
+    ctx = StubContext()
+
+    await run(admin_cog, "economy_inspect", ctx, target())
+
+    body = ctx.replies[0]
+    assert "1,500" in body
+    assert "admin_give" in body
+
+
+async def test_inspect_explains_an_empty_history(admin_cog: Economy) -> None:
+    ctx = StubContext()
+
+    await run(admin_cog, "economy_inspect", ctx, target())
+
+    assert "No logged transactions" in ctx.replies[0]
+
+
+# -- who may run them --------------------------------------------------------
+
+
+def permission_context(bot: Bisky, user_id: int, *, administrator: bool) -> Any:
+    """A context carrying the guild permissions the checks look at."""
+    author = type(
+        "M",
+        (),
+        {
+            "id": user_id,
+            "display_name": "someone",
+            "guild_permissions": discord.Permissions(administrator=administrator),
+        },
+    )()
+    return cast(
+        Any,
+        type(
+            "Ctx",
+            (),
+            {
+                "bot": bot,
+                "author": author,
+                "guild": StubGuild(GUILD),
+                "cog": None,
+                "command": None,
+                "interaction": None,
+            },
+        )(),
+    )
+
+
+def command_named(cog: Economy, attribute: str) -> Any:
+    return cast(Any, getattr(type(cog), attribute))
+
+
+async def passes_checks(command: Any, ctx: Any) -> bool:
+    """Run only the command's own checks, as Command.can_run would."""
+    for predicate in command.checks:
+        if not await predicate(ctx):
+            return False
+    return True
+
+
+@pytest.mark.parametrize(
+    "attribute", ["economy_give", "economy_take", "economy_reset", "economy_inspect"]
+)
+async def test_admin_commands_reject_a_guild_administrator(
+    admin_cog: Economy, admin_bot: Bisky, attribute: str
+) -> None:
+    """The point of the split: minting aura is not a guild-admin power.
+
+    A server owner tuning their own rates is fine; handing themselves half a
+    million aura is not.
+    """
+    ctx = permission_context(admin_bot, 999, administrator=True)
+
+    with pytest.raises(NotGlobalAdmin):
+        await passes_checks(command_named(admin_cog, attribute), ctx)
+
+
+@pytest.mark.parametrize(
+    "attribute", ["economy_give", "economy_take", "economy_reset", "economy_inspect"]
+)
+async def test_admin_commands_admit_a_global_admin(
+    admin_cog: Economy, admin_bot: Bisky, attribute: str
+) -> None:
+    ctx = permission_context(admin_bot, USER, administrator=False)
+
+    assert await passes_checks(command_named(admin_cog, attribute), ctx) is True
+
+
+async def test_tuning_commands_still_admit_a_guild_administrator(
+    admin_cog: Economy, admin_bot: Bisky
+) -> None:
+    """`economy set` stays a guild-admin power, unlike `economy give`."""
+    ctx = permission_context(admin_bot, 999, administrator=True)
+
+    assert await passes_checks(command_named(admin_cog, "economy_set"), ctx) is True
+
+
+async def test_tuning_commands_reject_a_plain_member(admin_cog: Economy, admin_bot: Bisky) -> None:
+    ctx = permission_context(admin_bot, 999, administrator=False)
+
+    with pytest.raises(NotGuildAdmin):
+        await passes_checks(command_named(admin_cog, "economy_set"), ctx)
+
+
+async def test_every_admin_command_carries_its_own_check(admin_cog: Economy) -> None:
+    """A group with invoke_without_command=True does not run its own checks
+    when a subcommand is invoked, so an unchecked subcommand is wide open."""
+    for attribute in ("economy_give", "economy_take", "economy_reset", "economy_inspect"):
+        command = command_named(admin_cog, attribute)
+        assert command.checks, f"{attribute} has no check of its own"

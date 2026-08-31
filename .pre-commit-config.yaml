@@ -17,6 +17,10 @@ repos:
       # Every CI job starts with `uv sync --locked`, so a lockfile that has
       # drifted from pyproject.toml fails the whole pipeline on push. Catch it
       # here, where the fix is `uv lock` rather than a round trip.
+      #
+      # Note this only reproduces when pre-commit is invoked directly, as git
+      # does. `uv run pre-commit ...` re-locks the project before pre-commit
+      # starts, silently repairing the drift it was meant to catch.
       - id: uv-lock-check
         name: uv.lock is in sync with pyproject.toml
         entry: uv lock --check

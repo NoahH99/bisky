@@ -117,6 +117,63 @@ async def debit_wallet(session: AsyncSession, guild_id: int, user_id: int, amoun
     return _rowcount(result) == 1
 
 
+async def credit_bank(
+    session: AsyncSession, guild_id: int, user_id: int, amount: int
+) -> EconomyAccount:
+    """Add aura straight to the bank, bypassing the deposit fee.
+
+    Only administrative grants use this; ordinary players must go through
+    :func:`move_to_bank` and pay the fee.
+    """
+    account = await get_account(session, guild_id, user_id)
+    if amount > 0:
+        account.bank += amount
+        await session.flush()
+    return account
+
+
+async def debit_bank(session: AsyncSession, guild_id: int, user_id: int, amount: int) -> bool:
+    """Remove aura from a bank, refusing to overdraw."""
+    if amount <= 0:
+        return False
+    result = await session.execute(
+        update(EconomyAccount)
+        .where(
+            EconomyAccount.guild_id == guild_id,
+            EconomyAccount.user_id == user_id,
+            EconomyAccount.bank >= amount,
+        )
+        .values(bank=EconomyAccount.bank - amount)
+    )
+    return _rowcount(result) == 1
+
+
+async def clear_balances(session: AsyncSession, guild_id: int, user_id: int) -> tuple[int, int]:
+    """Zero an account, returning the (wallet, bank) that were removed."""
+    account = await get_account(session, guild_id, user_id)
+    removed = (account.wallet, account.bank)
+    account.wallet = 0
+    account.bank = 0
+    await session.flush()
+    return removed
+
+
+async def recent_transactions(
+    session: AsyncSession, guild_id: int, user_id: int, *, limit: int = 10
+) -> list[EconomyTransaction]:
+    """Most recent logged movements for one account, newest first."""
+    stmt = (
+        select(EconomyTransaction)
+        .where(
+            EconomyTransaction.guild_id == guild_id,
+            EconomyTransaction.user_id == user_id,
+        )
+        .order_by(EconomyTransaction.created_at.desc(), EconomyTransaction.id.desc())
+        .limit(limit)
+    )
+    return list((await session.scalars(stmt)).all())
+
+
 async def move_to_bank(
     session: AsyncSession, guild_id: int, user_id: int, amount: int, *, fee: int
 ) -> bool:
